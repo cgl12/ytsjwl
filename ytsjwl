@@ -1,0 +1,225 @@
+import pandas as pd
+import numpy as np
+from tensorflow import keras
+from keras.models import Model
+import tensorflow as tf
+tf.compat.v1.enable_eager_execution()
+from tensorflow.keras.layers import Input, Dense, LSTM, Attention # 导入LSTM层
+from tensorflow.keras.layers import Layer
+from importlib_metadata import metadata
+
+
+# 读取数据集
+data = pd.read_csv('D:\数据集\上证指数历史数据 (1).csv')
+data=data.drop('data',axis=1)
+data=data.iloc[::-1]
+data=data.reset_index(drop=True)
+data.info()
+data['close'] = data['close'].str.replace(',', '', regex=True)
+data['close']=np.array(data['close'],dtype=np.float)
+#data['volume'] = data['volume'].str.replace(',', '', regex=True)
+data['volume']=np.array(data['volume'],dtype=np.float)
+data['open'] = data['open'].str.replace(',', '', regex=True)
+data['open']=np.array(data['open'],dtype=np.float)
+data['low'] = data['low'].str.replace(',', '', regex=True)
+data['low']=np.array(data['low'],dtype=np.float)
+data['high'] = data['high'].str.replace(',', '', regex=True)
+data['high']=np.array(data['high'],dtype=np.float)
+
+# 提取收盘价、开盘价、最高价、最低价和成交量
+price = data.loc[:,'close']
+open = data.loc[:,'open']
+high = data.loc[:,'high']
+low = data.loc[:,'low']
+volume = data.loc[:,'volume']
+
+# 归一化
+price_norm = price / max(price)
+open_norm = open / max(open)
+high_norm = high / max(high)
+low_norm = low / max(low)
+volume_norm = volume / max(volume)
+
+# 定义序列长度
+sequence_length = 8
+
+# 提取数据和标签
+def extract_data(data1, data2, data3, data4, data5, slide):    
+    x1 = []
+    x2 = []
+    x3 = []
+    x4 = []
+    x5 = []
+    y = []
+    
+    for i in range(len(data1) - slide):
+        x1.append([a for a in data1[i:i+slide]])
+        x2.append([b for b in data2[i:i+slide]])
+        x3.append([c for c in data3[i:i+slide]])
+        x4.append([d for d in data4[i:i+slide]])
+        x5.append([e for e in data5[i:i+slide]])
+        y.append(data1[i+slide])
+        #data1[i+slide]
+        #print(len(data1) - slide)
+        #print(slide)
+        #print(x1)
+        #print(data1[i+slide])
+        #print(y)
+        #data1[i+slide]
+        #print(data1[i])
+    x1 = np.array(x1)
+    x2 = np.array(x2)
+    x3 = np.array(x3)
+    x4 = np.array(x4)
+    x5 = np.array(x5)
+    x1 = np.expand_dims(x1,axis=2) # 增加一个维度
+    x2 = np.expand_dims(x2,axis=2) # 增加一个维度
+    x3 = np.expand_dims(x3,axis=2) # 增加一个维度
+    x4 = np.expand_dims(x4,axis=2) # 增加一个维度
+    x5 = np.expand_dims(x5,axis=2) # 增加一个维度
+    x = np.concatenate((x1,x2,x3,x4,x5),axis=2) # 将五个特征拼接在一起
+    x = x.reshape(x.shape[0],x.shape[1],5) # 将特征维度设为5
+    #print(x)
+    y = np.array(y)
+    return x,y
+
+X,y = extract_data(price_norm,open_norm,high_norm,low_norm,volume_norm,sequence_length)
+
+# 划分训练集和测试集
+X_train = X[:2500]
+y_train = y[:2500]
+X_test = X[2500:]
+y_test = y[2500:]
+
+
+# 定义液体神经网络和注意力机制模型
+inputs = Input(shape=(X.shape[1],X.shape[2]))
+# 定义一个嵌套的微分方程组，来描述参数如何随时间变化
+# 这里只是一个简单的例子，你可以根据你的数据或任务来设计你自己的方程组
+def ode_func(x,t):
+  # x是一个向量，表示当前的参数值
+  # t是一个标量，表示当前的时间步
+  # 返回一个向量，表示参数的变化率
+  # 这里我们假设参数的变化率只和当前的参数值有关，而不和时间步有关
+  # 你可以根据你的需要来修改这个假设
+  # 我们使用一个简单的线性函数来描述参数的变化率，你可以使用更复杂的非线性函数
+  # 我们使用一个随机矩阵A来表示线性函数的系数，你可以使用更合理的矩阵
+    A = np.random.randn(x.shape[0],x.shape[0])
+    return A.dot(x)
+
+# 定义一个函数，来根据微分方程组更新参数
+def update_params(x,t):
+  # x是一个向量，表示当前的参数值
+  # t是一个标量，表示当前的时间步
+  # 返回一个向量，表示更新后的参数值
+  # 我们使用欧拉法来近似求解微分方程组，你可以使用更精确的数值方法
+  # 我们使用一个固定的步长dt来更新时间步，你可以使用更灵活的步长
+    dt = 0.01
+    return x + ode_func(x,t) * dt
+
+# 定义一个自定义层，来实现液体神经网络
+class LiquidLSTM(Layer):
+    def __init__(self,units,input_size,activation='relu',return_sequences=True,dynamic=True):
+        super(LiquidLSTM,self).__init__()
+        self.units = units # 神经元个数
+        self.input_size = input_size # 输入形状
+        self.activation = activation # 激活函数
+        self.return_sequences = return_sequences # 是否返回序列
+
+        # 初始化LSTM层的参数，包括权重矩阵和偏置向量
+        self.Wf = self.add_weight(shape=(input_size[-1]+units,units),initializer='glorot_uniform',name='Wf') # 遗忘门权重矩阵
+        self.Wi = self.add_weight(shape=(input_size[-1]+units,units),initializer='glorot_uniform',name='Wi') # 输入门权重矩阵
+        self.Wc = self.add_weight(shape=(input_size[-1]+units,units),initializer='glorot_uniform',name='Wc') # 候选记忆细胞权重矩阵
+        self.Wo = self.add_weight(shape=(input_size[-1]+units,units),initializer='glorot_uniform',name='Wo') # 输出门权重矩阵
+
+        self.bf = self.add_weight(shape=(units,),initializer='zeros',name='bf') # 遗忘门偏置向量
+        self.bi = self.add_weight(shape=(units,),initializer='zeros',name='bi') # 输入门偏置向量
+        self.bc = self.add_weight(shape=(units,),initializer='zeros',name='bc') # 候选记忆细胞偏置向量
+        self.bo = self.add_weight(shape=(units,),initializer='zeros',name='bo') # 输出门偏置向量
+        
+ 
+
+    def call(self,x):
+        
+        
+      
+        # x是一个张量，表示输入序列，形状为(batch_size,time_steps,input_dim)
+        batch_size = tf.shape(x)[0] # 批次大小
+        time_steps = tf.shape(x)[1] # 时间步数
+
+        # 初始化隐藏状态和记忆细胞，形状为(batch_size,units)
+        h = tf.zeros((batch_size,self.units))
+        c = tf.zeros((batch_size,self.units))
+
+        # 初始化输出序列，形状为(batch_size,time_steps,units)
+        outputs = tf.TensorArray(tf.float32,time_steps)
+
+        # 对每个时间步进行循环
+        for t in range(time_steps):
+          # 获取当前时间步的输入，形状为(batch_size,input_dim)
+            x_t = x[:,t,:]
+
+         # 根据微分方程组更新参数，形状不变
+            self.Wf = update_params(self.Wf,t)
+            self.Wi = update_params(self.Wi,t)
+            self.Wc = update_params(self.Wc,t)
+            self.Wo = update_params(self.Wo,t)
+
+            self.bf = update_params(self.bf,t)
+            self.bi = update_params(self.bi,t)
+            self.bc = update_params(self.bc,t)
+            self.bo = update_params(self.bo,t)
+
+      # 拼接当前输入和上一时刻的隐藏状态，形状为(batch_size,input_dim+units)
+        x_h = tf.concat([x_t,h],axis=-1)
+
+      # 计算遗忘门的输出，形状为(batch_size,units)
+        f_t = tf.sigmoid(tf.matmul(x_h,self.Wf) + self.bf)
+
+      # 计算输入门的输出，形状为(batch_size,units)
+        i_t = tf.sigmoid(tf.matmul(x_h,self.Wi) + self.bi)
+
+      # 计算候选记忆细胞的输出，形状为(batch_size,units)
+        c_tilde_t = tf.nn.tanh(tf.matmul(x_h,self.Wc) + self.bc)
+
+      # 计算当前时刻的记忆细胞，形状为(batch_size,units)
+        c_t = f_t * c + i_t * c_tilde_t
+
+      # 计算输出门的输出，形状为(batch_size,units)
+        o_t = tf.sigmoid(tf.matmul(x_h,self.Wo) + self.bo)
+
+      # 计算当前时刻的隐藏状态，形状为(batch_size,units)
+        h_t = o_t * tf.nn.tanh(c_t)
+
+      # 将当前时刻的隐藏状态写入输出序列
+        outputs = outputs.write(t,h_t)
+
+      # 更新隐藏状态和记忆细胞
+        h = h_t
+        c = c_t
+
+    # 将输出序列转换为张量，形状为(batch_size,time_steps,units)
+        outputs = outputs.stack()
+        outputs = tf.transpose(outputs,[1,0,2])
+
+    # 如果不返回序列，则只返回最后一个时间步的隐藏状态，形状为(batch_size,units)
+        if not self.return_sequences:
+            outputs = outputs[:,-1,:]
+
+    # 返回输出序列或最后一个时间步的隐藏状态
+        return outputs
+
+
+# 定义一个LiquidLSTM层，作为第一层
+rnn1 = LiquidLSTM(units=130,input_size=(X.shape[1],X.shape[2]),activation='relu',return_sequences=True)(inputs)
+# 定义一个普通的LSTM层，作为第二层
+rnn2 = LSTM(units=130,input_shape=(X.shape[1],X.shape[2]),activation='relu',return_sequences=True)(rnn1)
+# 定义一个注意力机制层，来融合两层的输出
+attention = Attention()([rnn1,rnn2])
+# 定义一个全连接层，来降维
+dense1 = Dense(units=50,activation='relu')(attention)
+# 定义一个全连接层，来输出预测值
+dense2 = Dense(units=1,activation='linear')(dense1)
+# 定义模型
+model = Model(inputs=inputs,outputs=dense2)
+model.summary()
